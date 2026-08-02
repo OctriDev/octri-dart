@@ -147,9 +147,10 @@ abstract final class Octri {
     final config = _config;
     if (config == null) return;
     final requestedEventId = options.eventId;
-    final eventId = requestedEventId != null && _safeHeaderValue(requestedEventId)
-        ? requestedEventId
-        : _randomHex(16);
+    final eventId =
+        requestedEventId != null && _safeHeaderValue(requestedEventId)
+            ? requestedEventId
+            : _randomHex(16);
     final payload = _compact(<String, Object?>{
       'eventId': eventId,
       'timestamp':
@@ -211,7 +212,9 @@ abstract final class Octri {
   static void captureSpan(OctriSpan span) {
     final config = _config;
     if (config == null) return;
-    if (span.traceId.isEmpty || span.spanId.isEmpty || span.name.isEmpty) return;
+    if (span.traceId.isEmpty || span.spanId.isEmpty || span.name.isEmpty) {
+      return;
+    }
     final payload = _compact(<String, Object?>{
       'traceId': span.traceId,
       'spanId': span.spanId,
@@ -251,7 +254,8 @@ abstract final class Octri {
         request.headers.set('authorization', 'Bearer $token');
       }
       request.add(utf8.encode(jsonEncode(payload)));
-      final response = await request.close().timeout(const Duration(seconds: 5));
+      final response =
+          await request.close().timeout(const Duration(seconds: 5));
       await response.drain<void>().timeout(const Duration(seconds: 5));
     } catch (_) {
       // Monitoring must never affect the application.
