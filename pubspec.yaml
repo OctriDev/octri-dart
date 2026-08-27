@@ -2,6 +2,13 @@ name: octri_monitoring
 description: Standalone application monitoring and error reporting for Dart.
 version: 0.0.0
 homepage: https://octri.dev
+documentation: https://docs.octri.dev/docs
+issue_tracker: https://octri.dev/support
+repository: https://github.com/octridev/octri-dart
+topics:
+  - monitoring
+  - observability
+  - error-tracking
 environment:
   sdk: '>=3.2.0 <4.0.0'
 dev_dependencies:
