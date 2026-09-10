@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1
+
+- Dartdoc comments on the whole public API, and a library comment.
+- A runnable example under `example/`, showing an HTTP server that
+  continues an inbound trace, reports an error against it and times the
+  request.
+
 ## 1.0.0
 
 First public release.
