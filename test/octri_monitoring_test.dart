@@ -22,6 +22,29 @@ void main() {
     expect(trace.parentSpanId, isNull);
   });
 
+  test('replaces an oversized event id', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    final received = server.first.timeout(const Duration(seconds: 3));
+
+    Octri.init(OctriConfig(
+      url: 'http://127.0.0.1:${server.port}/',
+      token: 'project-token',
+      environment: 'project-1',
+    ));
+    Octri.captureEvent(
+      'checkout.completed',
+      options: OctriEventOptions(eventId: 'e' * 257),
+    );
+
+    final request = await received;
+    await request.drain<void>();
+    expect(request.headers.value('idempotency-key'),
+        matches(RegExp(r'^[0-9a-f]{32}$')));
+    request.response.statusCode = HttpStatus.accepted;
+    await request.response.close();
+  });
+
   test('sends scoped auth and replaces an unsafe idempotency key', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     addTearDown(() => server.close(force: true));

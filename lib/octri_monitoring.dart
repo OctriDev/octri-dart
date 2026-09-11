@@ -226,7 +226,14 @@ class OctriSpan {
 ///
 /// Delivery is asynchronous and best-effort. Transport failures are suppressed
 /// so telemetry cannot affect the host application.
+/// Hook run on every payload just before it is sent. Return the payload to send
+/// it, or `null` to drop the event. See [Octri.setBeforeSend].
+typedef OctriBeforeSend = Map<String, Object?>? Function(
+  Map<String, Object?> payload,
+);
+
 abstract final class Octri {
+  static const int _maxIdempotencyKeyLength = 256;
   static OctriConfig? _config;
   static final Random _random = Random.secure();
   static final RegExp _traceparent = RegExp(
@@ -241,6 +248,164 @@ abstract final class Octri {
   /// Calling it again replaces the settings for subsequent calls.
   static void init(OctriConfig config) {
     _config = config;
+  }
+
+  // ── Scrubbing ──────────────────────────────────────────────────────────────
+
+  /// Keys whose value never leaves the process. Compared against the key with
+  /// case and separators removed, so `api_key`, `apiKey` and `API-KEY` all match
+  /// `apikey`, and the test is a substring one, so `stripeSecretKey` matches too.
+  static const List<String> _scrubKeys = [
+    'password',
+    'passwd',
+    'passphrase',
+    'secret',
+    'token',
+    'apikey',
+    'authorization',
+    'credential',
+    'cookie',
+    'session',
+    'privatekey',
+    'accesskey',
+    'cardnumber',
+    'creditcard',
+    'cvv',
+    'ssn',
+  ];
+
+  static const String _redacted = '[redacted]';
+  static const String _truncated = '[truncated]';
+  static const String _circular = '[circular]';
+
+  /// Deep enough for real context maps, shallow enough to stay cheap.
+  static const int _maxScrubDepth = 8;
+
+  static final RegExp _bearer =
+      RegExp(r'\bbearer\s+[\w.~+/-]+=*', caseSensitive: false);
+  static final RegExp _jwt = RegExp(r'\beyJ[\w-]+\.[\w-]+\.[\w-]+');
+  static final RegExp _digitRun = RegExp(r'\b(?:\d[ -]?){12,18}\d\b');
+  static final RegExp _email = RegExp(r'[\w.%+-]+@[\w-]+(?:\.[\w-]+)+');
+  static final RegExp _nonDigit = RegExp(r'\D');
+  static final RegExp _nonAlphanumeric = RegExp('[^a-z0-9]');
+
+  static final List<String> _extraScrubKeys = [];
+  static OctriBeforeSend? _beforeSend;
+
+  /// Redacts more key names, on top of the built-in list.
+  ///
+  /// Matching ignores case and separators and is a substring test, so
+  /// `account` also covers `accountNumber`:
+  ///
+  /// ```dart
+  /// Octri.addScrubFields(['accountNumber', 'otp']);
+  /// ```
+  static void addScrubFields(Iterable<String> fields) {
+    for (final field in fields) {
+      final key = _normalizeKey(field);
+      if (key.isNotEmpty && !_extraScrubKeys.contains(key)) {
+        _extraScrubKeys.add(key);
+      }
+    }
+  }
+
+  /// Runs [hook] on every payload just before it is sent.
+  ///
+  /// Return the payload (editing it is fine) to send it, or `null` to drop the
+  /// event:
+  ///
+  /// ```dart
+  /// Octri.setBeforeSend((payload) => payload['path'] == '/health' ? null : payload);
+  /// ```
+  ///
+  /// Redaction still runs afterwards, so a hook cannot leak a credential by
+  /// accident. Pass `null` to remove the hook.
+  static void setBeforeSend(OctriBeforeSend? hook) {
+    _beforeSend = hook;
+  }
+
+  static String _normalizeKey(String key) =>
+      key.toLowerCase().replaceAll(_nonAlphanumeric, '');
+
+  static bool _isSecretKey(String key) {
+    final normalized = _normalizeKey(key);
+    if (normalized.isEmpty) return false;
+    return _scrubKeys.any((candidate) => normalized.contains(candidate)) ||
+        _extraScrubKeys.any((candidate) => normalized.contains(candidate));
+  }
+
+  /// Tells a card number from the order ids and timestamps that look like one.
+  static bool _passesLuhn(String digits) {
+    var sum = 0;
+    var doubling = false;
+    for (var index = digits.length - 1; index >= 0; index--) {
+      var digit = digits.codeUnitAt(index) - 0x30;
+      if (doubling) {
+        digit *= 2;
+        if (digit > 9) digit -= 9;
+      }
+      sum += digit;
+      doubling = !doubling;
+    }
+    return sum % 10 == 0;
+  }
+
+  /// Removes credentials and personal data that leaked into free text.
+  static String _scrubText(String value) {
+    if (value.isEmpty) return value;
+    var scrubbed = value.replaceAll(_bearer, _redacted);
+    scrubbed = scrubbed.replaceAll(_jwt, _redacted);
+    scrubbed = scrubbed.replaceAllMapped(_digitRun, (match) {
+      final run = match[0]!;
+      return _passesLuhn(run.replaceAll(_nonDigit, '')) ? _redacted : run;
+    });
+    return scrubbed.replaceAll(_email, _redacted);
+  }
+
+  /// Redacts credential-shaped keys anywhere in the payload, and strips secrets
+  /// out of the free text around them. `user` is the field you deliberately fill
+  /// with an identity, so its strings are left alone; its keys are still checked.
+  static Object? _scrubValue(
+    Object? value,
+    int depth,
+    bool text,
+    Set<Object> seen,
+  ) {
+    if (value is String) return text ? _scrubText(value) : value;
+    if (value is! Map && value is! Iterable) return value;
+    if (depth >= _maxScrubDepth) return _truncated;
+    final container = value as Object;
+    // Walking a copy means a cycle would recurse forever, and a context map
+    // holding a reference back to itself is worth surviving.
+    if (!seen.add(container)) return _circular;
+    try {
+      if (container is Iterable) {
+        return container
+            .map((item) => _scrubValue(item, depth + 1, text, seen))
+            .toList();
+      }
+      final out = <String, Object?>{};
+      (container as Map).forEach((key, nested) {
+        final name = key.toString();
+        out[name] = _isSecretKey(name)
+            ? _redacted
+            : _scrubValue(nested, depth + 1, text && name != 'user', seen);
+      });
+      return out;
+    } finally {
+      seen.remove(container);
+    }
+  }
+
+  /// The last thing every payload passes through. Both the hook and the
+  /// redaction live here rather than in the capture methods, so nothing can be
+  /// reported around them.
+  static Map<String, Object?>? _scrubPayload(Map<String, Object?> payload) {
+    final hook = _beforeSend;
+    final hooked = hook == null ? payload : hook(payload);
+    if (hooked == null) return null;
+    return _scrubValue(hooked, 0, true, Set<Object>.identity())
+        as Map<String, Object?>;
   }
 
   /// Reads a W3C `traceparent` header into a trace context.
@@ -277,7 +442,7 @@ abstract final class Octri {
     if (config == null) return;
     final requestedEventId = options.eventId;
     final eventId =
-        requestedEventId != null && _safeHeaderValue(requestedEventId)
+        requestedEventId != null && _safeIdempotencyKey(requestedEventId)
             ? requestedEventId
             : _randomHex(16);
     final payload = _compact(<String, Object?>{
@@ -381,11 +546,13 @@ abstract final class Octri {
   ) async {
     HttpClient? client;
     try {
-      if (!_safeHeaderValue(idempotencyKey) ||
+      if (!_safeIdempotencyKey(idempotencyKey) ||
           (config.token?.isNotEmpty == true &&
               !_safeHeaderValue(config.token!))) {
         return;
       }
+      final scrubbed = _scrubPayload(payload);
+      if (scrubbed == null) return;
       client = HttpClient()..connectionTimeout = const Duration(seconds: 1);
       final request = await client.postUrl(Uri.parse(config.url + path));
       request.headers.contentType = ContentType.json;
@@ -394,7 +561,7 @@ abstract final class Octri {
       if (token != null && token.isNotEmpty) {
         request.headers.set('authorization', 'Bearer $token');
       }
-      request.add(utf8.encode(jsonEncode(payload)));
+      request.add(utf8.encode(jsonEncode(scrubbed)));
       final response =
           await request.close().timeout(const Duration(seconds: 5));
       await response.drain<void>().timeout(const Duration(seconds: 5));
@@ -415,6 +582,12 @@ abstract final class Octri {
 
   static bool _safeHeaderValue(String value) =>
       value.isNotEmpty && !value.contains('\r') && !value.contains('\n');
+
+  /// A caller-supplied event id becomes the `idempotency-key` header, so it is
+  /// bounded as well as newline-free.
+  static bool _safeIdempotencyKey(String value) =>
+      _safeHeaderValue(value) &&
+      utf8.encode(value).length <= _maxIdempotencyKeyLength;
 
   static String _randomHex(int bytes) => List<int>.generate(
         bytes,
